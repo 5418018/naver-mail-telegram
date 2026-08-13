@@ -1,12 +1,17 @@
 name: Naver Mail Telegram
 
 on:
-  # 수동 테스트 실행
   workflow_dispatch:
 
-  # 자동 실행
   schedule:
     - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: naver-mail-check
+  cancel-in-progress: false
 
 jobs:
   check-mail:
@@ -28,3 +33,19 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python naver_mail.py
+
+      - name: 처리 기록 저장
+        run: |
+          if [ -f processed_uidls.txt ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            git add processed_uidls.txt
+
+            if ! git diff --cached --quiet; then
+              git commit -m "Update processed mail UIDLs"
+              git push
+            else
+              echo "저장할 새로운 UIDL이 없습니다."
+            fi
+          fi
