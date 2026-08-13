@@ -6,10 +6,11 @@ import urllib.parse
 import urllib.request
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone, timedelta
+from datetime import timezone, timedelta
 
 # ============================================================
-# 네이버 메일 → Telegram 새 메일 알림
+# 네이버 메일 → Telegram 알림
+# POP3 UIDL을 이용한 중복 알림 방지
 # ============================================================
 
 NAVER_EMAIL = os.environ["NAVER_EMAIL"]
@@ -20,12 +21,15 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 POP_SERVER = "pop.naver.com"
 POP_PORT = 995
 
+STATE_FILE = "processed_uidls.txt"
+
 KST = timezone(timedelta(hours=9))
 
 
-# ------------------------------------------------------------
-# 메일 제목/보낸사람 한글 디코딩
-# ------------------------------------------------------------
+# ============================================================
+# 한글 제목 / 발신자 디코딩
+# ============================================================
+
 def decode_text(value):
     if not value:
         return ""
@@ -33,21 +37,32 @@ def decode_text(value):
     result = ""
 
     for text, charset in decode_header(value):
+
         if isinstance(text, bytes):
             try:
-                result += text.decode(charset or "utf-8", errors="replace")
+                result += text.decode(
+                    charset or "utf-8",
+                    errors="replace"
+                )
+
             except Exception:
-                result += text.decode("utf-8", errors="replace")
+                result += text.decode(
+                    "utf-8",
+                    errors="replace"
+                )
+
         else:
             result += text
 
     return result
 
 
-# ------------------------------------------------------------
-# Telegram 메시지 전송
-# ------------------------------------------------------------
+# ============================================================
+# Telegram 전송
+# ============================================================
+
 def send_telegram(text):
+
     url = (
         f"https://api.telegram.org/bot"
         f"{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -60,31 +75,92 @@ def send_telegram(text):
         "disable_web_page_preview": "true"
     }).encode("utf-8")
 
-    request = urllib.request.Request(url, data=data)
+    request = urllib.request.Request(
+        url,
+        data=data
+    )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(
+        request,
+        timeout=30
+    ) as response:
+
         response.read()
 
 
-# ------------------------------------------------------------
-# 메일 날짜 가져오기
-# ------------------------------------------------------------
-def get_mail_datetime(msg):
+# ============================================================
+# 처리한 UIDL 불러오기
+# ============================================================
+
+def load_processed_uidls():
+
+    if not os.path.exists(STATE_FILE):
+        return set()
+
+    with open(
+        STATE_FILE,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        return {
+            line.strip()
+            for line in f
+            if line.strip()
+        }
+
+
+# ============================================================
+# 처리한 UIDL 저장
+# ============================================================
+
+def save_processed_uidls(uidls):
+
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        for uidl in sorted(uidls):
+            f.write(uidl + "\n")
+
+
+# ============================================================
+# 메일 수신시간
+# ============================================================
+
+def get_mail_date(msg):
+
     try:
-        dt = parsedate_to_datetime(msg.get("Date"))
+
+        dt = parsedate_to_datetime(
+            msg.get("Date")
+        )
+
+        if dt is None:
+            return "시간 정보 없음"
 
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
 
-        return dt.astimezone(KST)
+        dt = dt.astimezone(KST)
+
+        return dt.strftime(
+            "%Y-%m-%d %H:%M"
+        )
 
     except Exception:
-        return None
+
+        return "시간 정보 없음"
 
 
-# ------------------------------------------------------------
+# ============================================================
 # 메인
-# ------------------------------------------------------------
+# ============================================================
+
 def main():
 
     print("네이버 메일 서버에 접속합니다.")
@@ -96,83 +172,197 @@ def main():
     )
 
     try:
+
+        # ----------------------------------------------------
+        # 네이버 로그인
+        # ----------------------------------------------------
+
         pop.user(NAVER_EMAIL)
         pop.pass_(NAVER_APP_PASSWORD)
 
         message_count, mailbox_size = pop.stat()
 
-        print(f"현재 메일 수: {message_count}")
+        print(
+            f"현재 POP3 메일 수: "
+            f"{message_count}"
+        )
 
-        if message_count == 0:
-            print("메일이 없습니다.")
+        # ----------------------------------------------------
+        # POP3 UIDL 목록 가져오기
+        # ----------------------------------------------------
+
+        response, uidl_lines, octets = pop.uidl()
+
+        current_messages = []
+
+        for line in uidl_lines:
+
+            parts = line.decode(
+                "utf-8",
+                errors="replace"
+            ).split()
+
+            if len(parts) >= 2:
+
+                message_number = int(parts[0])
+                uidl = parts[1]
+
+                current_messages.append(
+                    (
+                        message_number,
+                        uidl
+                    )
+                )
+
+        current_uidls = {
+            uidl
+            for _, uidl in current_messages
+        }
+
+        # ----------------------------------------------------
+        # 이전 처리 기록
+        # ----------------------------------------------------
+
+        processed_uidls = (
+            load_processed_uidls()
+        )
+
+        # ----------------------------------------------------
+        # 최초 실행
+        # ----------------------------------------------------
+
+        if not processed_uidls:
+
+            print(
+                "최초 실행입니다."
+            )
+
+            print(
+                "현재 존재하는 메일은 "
+                "기준점으로만 저장합니다."
+            )
+
+            processed_uidls.update(
+                current_uidls
+            )
+
+            save_processed_uidls(
+                processed_uidls
+            )
+
+            print(
+                f"기존 메일 "
+                f"{len(current_uidls)}개를 "
+                "기준점으로 등록했습니다."
+            )
+
+            print(
+                "이제부터 새로 도착하는 "
+                "메일만 Telegram으로 전송됩니다."
+            )
+
             return
 
         # ----------------------------------------------------
-        # GitHub Actions 실행 시점 기준 최근 메일 확인
+        # 새 메일 확인
         # ----------------------------------------------------
-        now = datetime.now(KST)
 
-        # GitHub Actions를 5분마다 실행할 예정이므로
-        # 약간의 지연을 고려하여 최근 10분 메일을 확인
-        cutoff = now - timedelta(minutes=10)
+        new_messages = [
+            (number, uidl)
+            for number, uidl
+            in current_messages
+            if uidl not in processed_uidls
+        ]
 
-        # 너무 많은 메일을 읽지 않도록 최근 20개만 검사
-        start = max(1, message_count - 19)
+        if not new_messages:
 
-        found = 0
+            print(
+                "새 메일이 없습니다."
+            )
 
-        for i in range(start, message_count + 1):
+            return
 
-            response, lines, octets = pop.retr(i)
+        print(
+            f"새 메일 {len(new_messages)}개 발견"
+        )
 
-            raw_email = b"\r\n".join(lines)
+        # ----------------------------------------------------
+        # 새 메일 Telegram 전송
+        # ----------------------------------------------------
 
-            msg = email.message_from_bytes(raw_email)
+        for message_number, uidl in new_messages:
 
-            mail_datetime = get_mail_datetime(msg)
+            response, lines, octets = (
+                pop.retr(message_number)
+            )
 
-            if mail_datetime is None:
-                continue
+            raw_email = b"\r\n".join(
+                lines
+            )
 
-            # 최근 10분 이전 메일은 제외
-            if mail_datetime < cutoff:
-                continue
+            msg = email.message_from_bytes(
+                raw_email
+            )
 
-            subject = decode_text(msg.get("Subject"))
-            sender = decode_text(msg.get("From"))
+            subject = decode_text(
+                msg.get("Subject")
+            )
 
-            subject = html.escape(subject)
-            sender = html.escape(sender)
+            sender = decode_text(
+                msg.get("From")
+            )
 
-            date_text = mail_datetime.strftime(
-                "%Y-%m-%d %H:%M"
+            date_text = get_mail_date(
+                msg
+            )
+
+            safe_subject = html.escape(
+                subject
+            )
+
+            safe_sender = html.escape(
+                sender
             )
 
             telegram_message = (
                 "📩 <b>네이버 새 메일</b>\n\n"
-                f"👤 <b>보낸사람</b>\n{sender}\n\n"
-                f"📌 <b>제목</b>\n{subject}\n\n"
-                f"🕐 <b>수신시간</b>\n{date_text}"
+                f"👤 <b>보낸사람</b>\n"
+                f"{safe_sender}\n\n"
+                f"📌 <b>제목</b>\n"
+                f"{safe_subject}\n\n"
+                f"🕐 <b>수신시간</b>\n"
+                f"{date_text}"
             )
 
-            send_telegram(telegram_message)
+            # Telegram 전송 성공 후에만
+            # UIDL을 처리 완료로 기록
+            send_telegram(
+                telegram_message
+            )
+
+            processed_uidls.add(
+                uidl
+            )
+
+            save_processed_uidls(
+                processed_uidls
+            )
 
             print(
                 f"Telegram 전송 완료: "
-                f"{decode_text(msg.get('Subject'))}"
+                f"{subject}"
             )
 
-            found += 1
-
-        if found == 0:
-            print("최근 새 메일이 없습니다.")
-
-        else:
-            print(f"총 {found}개의 메일을 전송했습니다.")
+        print(
+            f"총 {len(new_messages)}개의 "
+            f"새 메일을 처리했습니다."
+        )
 
     finally:
+
         try:
             pop.quit()
+
         except Exception:
             pass
 
