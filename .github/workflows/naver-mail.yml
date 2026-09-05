@@ -2,7 +2,6 @@ name: Naver Mail Telegram
 
 on:
   workflow_dispatch:
-
   schedule:
     - cron: "*/5 * * * *"
 
@@ -16,36 +15,59 @@ concurrency:
 jobs:
   check-mail:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: 코드 가져오기
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Python 설정
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: 네이버 메일 확인
+      - name: 네이버 메일 확인 및 텔레그램 전송
         env:
           NAVER_EMAIL: ${{ secrets.NAVER_EMAIL }}
           NAVER_APP_PASSWORD: ${{ secrets.NAVER_APP_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PYTHONUNBUFFERED: "1"
         run: python naver_mail.py
 
       - name: 처리 기록 저장
+        if: ${{ always() }}
         run: |
-          if [ -f processed_uidls.txt ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set -euo pipefail
 
-            git add processed_uidls.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-            if ! git diff --cached --quiet; then
-              git commit -m "Update processed mail UIDLs"
-              git push
-            else
-              echo "저장할 새로운 UIDL이 없습니다."
+          for file in processed_uidls.txt telegram_progress.json; do
+            if [ -f "$file" ]; then
+              git add -- "$file"
             fi
+          done
+
+          if git diff --cached --quiet; then
+            echo "저장할 새로운 처리 기록이 없습니다."
+            exit 0
           fi
+
+          git commit -m "Update mail notification state"
+
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+
+            if [ "$attempt" -lt 3 ]; then
+              git pull --rebase
+              sleep 3
+            fi
+          done
+
+          echo "::error::처리 기록 저장 실패. 다음 실행에서 중복 알림이 발생할 수 있습니다."
+          exit 1
