@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from html.parser import HTMLParser
+from html import escape
+from urllib.parse import urlsplit
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -35,9 +37,10 @@ def api(url, payload, headers=None):
         raise RuntimeError('API 요청 실패: ' + str(getattr(exc, 'code', type(exc).__name__))) from None
 
 
-def telegram(text):
+def telegram(text, *, html=False):
     result = api('https://api.telegram.org/bot' + os.environ['TELEGRAM_TOKEN'] + '/sendMessage', {
         'chat_id': os.environ['TELEGRAM_CHAT_ID'], 'text': text,
+        **({'parse_mode': 'HTML'} if html else {}),
         'link_preview_options': {'is_disabled': True}})
     if not result.get('ok'):
         raise RuntimeError('Telegram 전송 실패')
@@ -57,17 +60,63 @@ def chunks(text):
     return result
 
 
+def linked_chunks(text):
+    """Escape mail text; shorten visible URLs without changing destinations."""
+    result, part, size, links = [], '', 0, 0
+
+    def append(rendered, visible_size, is_link=False):
+        nonlocal part, size, links
+        if part and (size + visible_size > 3400 or (is_link and links >= 50)):
+            result.append(part)
+            part, size, links = '', 0, 0
+        part += rendered
+        size += visible_size
+        links += int(is_link)
+
+    def plain(value):
+        for char in value:
+            append(escape(char, quote=False), 2 if ord(char) > 0xFFFF else 1)
+
+    cursor = 0
+    for match in re.finditer(r"https?://[^\s<>\x22]+", text, re.IGNORECASE):
+        plain(text[cursor:match.start()])
+        url = match.group()
+        # Keep sentence punctuation outside the link, including unmatched brackets.
+        suffix = ''
+        while url and (url[-1] in '.,;!' or
+                       (url[-1] == ')' and url.count(')') > url.count('(')) or
+                       (url[-1] == ']' and url.count(']') > url.count('['))):
+            suffix = url[-1] + suffix
+            url = url[:-1]
+        try:
+            host = urlsplit(url).hostname
+        except ValueError:
+            host = None
+        if host:
+            label = '링크 열기 · ' + (host if len(host) <= 32 else host[:29] + '…')
+            append('<a href="' + escape(url, quote=True) + '">' +
+                   escape(label) + '</a>', len(label.encode('utf-16-le')) // 2, True)
+            plain(suffix)
+        else:
+            plain(match.group())
+        cursor = match.end()
+    plain(text[cursor:])
+    if part:
+        result.append(part)
+    return result
+
+
 def deliver(state, key, text, deadline):
     record = state['sent'].get(key, {})
     if record.get('done'):
         return True
-    digest = hashlib.sha256(text.encode()).hexdigest()
+    digest = hashlib.sha256(('short-links-v1\n' + text).encode()).hexdigest()
     start = record.get('next', 0) if record.get('hash') == digest else 0
-    pieces = chunks(text)
+    pieces = linked_chunks(text)
     for index in range(start, len(pieces)):
         if time.monotonic() > deadline:
             return False
-        telegram(f'({index + 1}/{len(pieces)})\n' + pieces[index])
+        telegram(f'({index + 1}/{len(pieces)})\n' + pieces[index], html=True)
         state['sent'][key] = {'hash': digest, 'next': index + 1}
         save(state)
         time.sleep(1.1)
@@ -80,14 +129,23 @@ class PlainHTML(HTMLParser):
     def __init__(self):
         super().__init__()
         self.parts, self.hidden = [], 0
+        self.anchor = None
 
     def handle_starttag(self, tag, attrs):
         if tag in ('script', 'style', 'head'):
             self.hidden += 1
         if not self.hidden and tag in ('br', 'p', 'div', 'li', 'tr'):
             self.parts.append('\n')
+        if not self.hidden and tag == 'a':
+            href = dict(attrs).get('href', '')
+            self.anchor = (href, len(self.parts)) if href.lower().startswith(('https://', 'http://')) else None
 
     def handle_endtag(self, tag):
+        if tag == 'a' and self.anchor:
+            href, start = self.anchor
+            if href not in ''.join(self.parts[start:]):
+                self.parts.append(' <' + href + '>')
+            self.anchor = None
         if tag in ('script', 'style', 'head'):
             self.hidden = max(0, self.hidden - 1)
         if not self.hidden and tag in ('p', 'div', 'li', 'tr'):
